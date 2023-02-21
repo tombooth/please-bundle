@@ -1,0 +1,18 @@
+[package]
+name = "jsbundle"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.69"
+glob = "0.3.1"
+serde = "1.0.152"
+serde_json = "1.0.93"
+swc_bundler = "0.199.24"
+swc_common = {version = "0.29.31", features = [ "tty-emitter" ]}
+swc_ecma_ast = "0.96.6"
+swc_ecma_codegen = "0.129.13"
+swc_ecma_loader = "0.41.33"
+swc_ecma_parser = "0.124.10"
