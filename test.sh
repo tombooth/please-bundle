@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-if [ "$(./target/debug/jsbundle | node)" = "bibble wibble" ]
+if [ "$(./target/debug/please-bundle | node)" = "bibble wibble" ]
 then
 	echo "yay"
 	exit 0
