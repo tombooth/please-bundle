@@ -1,11 +1,10 @@
-use std::{collections::HashMap, path::PathBuf};
-use std::io::Read;
+use std::{collections::HashMap};
+use std::io::{Read, BufWriter};
+use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::str::FromStr;
 
 use anyhow::{Error, anyhow, bail};
-
-use glob::glob;
 
 use serde::Deserialize;
 
@@ -23,7 +22,32 @@ use swc_ecma_codegen::{
 };
 use swc_ecma_parser::{parse_file_as_module, EsConfig, Syntax};
 
+use clap::Parser;
 
+/// Simple program to greet a person
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+   #[arg(short, long, default_value_t = String::from("bundle.js"))]
+   output: String,
+
+   #[arg(short, long)]
+   map: Option<String>,
+
+   #[arg(short, long = "package")]
+   packages: Vec<String>,
+
+   inputs: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ExportConfig {
+    #[serde(default)]
+    import: Option<String>,
+
+    #[serde(default)]
+    default: Option<String>
+}
 
 #[derive(Deserialize)]
 struct PackageJson {
@@ -36,6 +60,9 @@ struct PackageJson {
     browser: Option<String>,
     #[serde(default)]
     module: Option<String>,
+
+    #[serde(default)]
+    exports: Option<HashMap<String, ExportConfig>>,
 }
 
 /*#[derive(Deserialize)]
@@ -53,48 +80,93 @@ enum StringOrBool {
 }
 
 
+fn load_package_entrypoint(path: PathBuf) -> Result<Vec<(String, FileName)>, Error> {
+    let mut file = File::open(&path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    let package_json: PackageJson = serde_json::from_str(&contents)?;
+    let package_dir = match path.parent() {
+        None => bail!("no package directory? {path:?}"),
+        Some(dir) => dir,
+    };
+
+    let name = match package_json.name {
+        None => bail!("no name for js package at {path:?}"),
+        Some(name) => name,
+    };
+
+    if let Some(exports) = package_json.exports {
+        exports.iter()
+            .map(|(export_name, config)| {
+                let entrypoints = [
+                    config.import.as_ref(),
+                    config.default.as_ref(),
+                ];
+
+                if let Some(Some(entrypoint)) = entrypoints.iter().find(|x| x.is_some()) {
+                    let entrypoint_path = PathBuf::from(entrypoint);
+                    let full_entrypoint = package_dir.join(entrypoint_path).canonicalize().unwrap();
+
+                    let mut full_export_name = name.clone();
+                    full_export_name.push_str(&export_name[1..]);
+
+                    Ok((full_export_name, FileName::Real(full_entrypoint)))
+                } else {
+                    Err(anyhow!("no entrypoint is set, don't know how to load the package"))
+                }
+            })
+            .collect::<Result<Vec<(String, FileName)>, Error>>()
+    } else {
+        let entrypoints = [
+            package_json.browser.as_ref(),
+            package_json.module.as_ref(),
+            package_json.main.as_ref(),
+        ];
+
+        if let Some(Some(entrypoint)) = entrypoints.iter().find(|x| x.is_some()) {
+            let full_entrypoint = package_dir.join(entrypoint).canonicalize()?;
+            Ok(vec![(name, FileName::Real(full_entrypoint))])
+        } else {
+            Err(anyhow!("no entrypoint is set, don't know how to load the package"))
+        }
+    }
+}
 
 
 fn main() -> Result<(), Error> {
 
-    // this should be loaded from a scan of package.json files inside of the
-    // workspace
-    let mut packages: HashMap<String, FileName> = HashMap::new();
+    let args = Args::parse();
 
-    for entry in glob("./example/**/package.json").expect("Failed to read glob pattern") {
-        match entry {
-            Ok(path) => {
-                let mut file = File::open(&path)?;
-                let mut contents = String::new();
-                file.read_to_string(&mut contents)?;
+    let packages: HashMap<String, FileName> = args.packages.iter()
+        .map(|package_path| Path::new(package_path).join("package.json"))
+        .filter(|package_path| package_path.exists())
+        .try_fold(HashMap::new(), |mut map, path| {
+            for (name, entrypoint_path) in load_package_entrypoint(path)? {
+                map.insert(name, entrypoint_path);
+            }
+            Ok::<HashMap<String, FileName>, Error>(map)
+        })?;
 
-                let package_json: PackageJson = serde_json::from_str(&contents)?;
-                let package_dir = match path.parent() {
-                    None => bail!("no package directory? {path:?}"),
-                    Some(dir) => dir,
-                };
+    eprintln!("packages: {:#?}", packages);
 
-                let name = match package_json.name {
-                    None => bail!("no name for js package at {path:?}"),
-                    Some(name) => name,
-                };
-
-                let entrypoints = [
-                    package_json.browser.as_ref(),
-                    package_json.module.as_ref(),
-                    package_json.main.as_ref(),
-                ];
-
-                if let Some(Some(entrypoint)) = entrypoints.iter().find(|x| x.is_some()) {
-                    let full_entrypoint = package_dir.join(entrypoint).canonicalize()?;
-                    packages.insert(name, FileName::Real(full_entrypoint));
+    let inputs:  Result<HashMap<String, FileName>, Error> = args.inputs.iter()
+        .map(|path| Path::new(path).to_path_buf())
+        .filter(|path| path.exists())
+        .try_fold(HashMap::new(), |mut map, path| {
+            if let Some(file_name) = path.file_name() {
+                if let Some(file_name_string) = file_name.to_str() {
+                    map.insert(String::from(file_name_string), FileName::Real(path));
+                    Ok(map)
                 } else {
-                    bail!("you what mate");
+                    Err(anyhow!("os string didn't convert to a &str"))
                 }
-            },
-            Err(e) => println!("{:?}", e),
-        }
-    }
+            } else {
+                Err(anyhow!("can't get file name for {:?}", path))
+            }
+        });
+
+    eprintln!("inputs: {:#?}", inputs);
 
     let globals = Globals::default();
     let cm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
@@ -115,21 +187,19 @@ fn main() -> Result<(), Error> {
         Box::new(Hook{}),
     );
 
-    let mut entries: HashMap<String, FileName> = HashMap::new();
-    entries.insert("main.js".to_string(), FileName::Real(PathBuf::from("./example/src/main.js")));
-
-    let modules = match bundler.bundle(entries) {
+    let modules = match bundler.bundle(inputs?) {
         Err(why) => panic!("failed to bundle: {why:?}"),
         Ok(modules) => modules,
     };
 
     assert!(modules.len() == 1, "we only expect one module to exist not: {}", modules.len());
 
+    let mut srcmap = vec![];
     let code = {
         let mut buf = vec![];
 
         {
-            let wr = JsWriter::new(cm.clone(), "\n", &mut buf, None);
+            let wr = JsWriter::new(cm.clone(), "\n", &mut buf, Some(&mut srcmap));
             let mut emitter = Emitter {
                 cfg: swc_ecma_codegen::Config {
                     minify: false,
@@ -147,6 +217,13 @@ fn main() -> Result<(), Error> {
     };
 
     println!("{}", code);
+
+    if let Some(map_path) = args.map {
+        let srcmap = cm.build_source_map(&srcmap);
+        let srcmap_file = File::create(map_path).unwrap();
+        let srcmap_wr = BufWriter::new(srcmap_file);
+        srcmap.to_writer(srcmap_wr).unwrap();
+    }
 
     Ok(())
 }
